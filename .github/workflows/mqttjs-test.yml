@@ -8,7 +8,7 @@ on:
         required: true
         default: 'mqttjs*'
   push:
-    branches: [ main ]
+    branches: [ main, 'validate/**' ]
   pull_request:
     branches: [ main ]
 
