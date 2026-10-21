@@ -529,6 +529,9 @@ Emitted on successful (re)connection (i.e. connack rc=0).
 - `connack` received connack packet. When `clean` connection option is `false` and server has a previous session
   for `clientId` connection option, then `connack.sessionPresent` flag is `true`. When that is the case,
   you may rely on stored session and prefer not to send subscribe commands for the client.
+  With `clean: false`, a `sessionPresent` of `false` means the broker did not resume the session: QoS 1 and 2 messages
+  already sent on the previous connection and never acknowledged are dropped and their publish callbacks get an error,
+  while messages queued while offline are still sent. `clean: true` drops nothing.
 
 #### Event `'reconnect'`
 

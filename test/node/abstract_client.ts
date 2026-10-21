@@ -4261,6 +4261,202 @@ export default function abstractTest(server, config, ports) {
 				})
 			},
 		)
+
+		// Session Present 0 tells a `clean: false` client that the broker no
+		// longer has its session, so what the client had in flight belongs to
+		// a session that is gone. Sending it again replays old messages into
+		// the new one (#1651). A message that was only queued while offline
+		// never reached the broker, so it is still sent.
+		//
+		// The client publishes 'sent' (QoS 1), which the first connection never
+		// acknowledges, and then 'acked', which it does. The client drops the
+		// socket on that ack. With `queueWhileOffline` it then publishes 'queued'
+		// while it is offline. The second connection answers with
+		// `sessionPresent`, and `verify` runs once it is up.
+		function reconnectAfterUnackedPublish(
+			done: DoneCallback,
+			opts: {
+				clean: boolean
+				sessionPresent: boolean
+				queueWhileOffline?: boolean
+				outgoingStore?: Store
+			},
+			verify: (seen: {
+				received: string[]
+				sent?: { err?: Error | null }
+				queued?: { err?: Error | null }
+			}) => void,
+		) {
+			const received: string[] = []
+			let connections = 0
+			let client: mqtt.MqttClient
+			let sent: { err?: Error | null } | undefined
+			let queued: { err?: Error | null } | undefined
+
+			const { check, finish, deadline } = guardDone((err) => {
+				client.end(true, (err1) => {
+					server2.close((err2) => {
+						done(err || err1 || err2)
+					})
+				})
+			})
+
+			const server2 = serverBuilder(config.protocol, (serverClient) => {
+				connections += 1
+				const connection = connections
+				serverClient.on('connect', () => {
+					// the first connection has no session to resume
+					const sessionPresent = connection > 1 && opts.sessionPresent
+					serverClient.connack(
+						version === 5
+							? { reasonCode: 0, sessionPresent }
+							: { returnCode: 0, sessionPresent },
+					)
+				})
+				serverClient.on('publish', (packet) => {
+					// 'sent' stays in flight on the first connection
+					if (connection === 1 && packet.topic === 'sent') return
+					if (connection > 1) received.push(packet.topic)
+					serverClient.puback(packet)
+				})
+			})
+
+			deadline(5000, 'the second connection never completed')
+			server2.listen(ports.PORTAND352, () => {
+				client = connect({
+					host: 'localhost',
+					port: ports.PORTAND352,
+					clientId: 'test',
+					clean: opts.clean,
+					outgoingStore: opts.outgoingStore,
+					reconnectPeriod: 100,
+				})
+				// Dropping the socket is how the test gets to connection 2, so
+				// the transport errors that follow it are expected noise.
+				client.on('error', () => {})
+				client.once('connect', () => {
+					client.publish('sent', 'payload', { qos: 1 }, (err) => {
+						sent = { err }
+					})
+					// a message id the unique provider hands out again
+					client.publish('acked', 'payload', { qos: 1 }, () => {
+						client.stream.end()
+					})
+					if (opts.queueWhileOffline) {
+						client.once('offline', () => {
+							client.publish(
+								'queued',
+								'payload',
+								{ qos: 1 },
+								(err) => {
+									queued = { err }
+								},
+							)
+						})
+					}
+					// the resend of the store finishes before this one fires
+					client.once('connect', () => {
+						check(() => {
+							assert.strictEqual(connections, 2)
+							verify({ received, sent, queued })
+						})
+						finish()
+					})
+				})
+			})
+		}
+
+		it('should not send a message again to a broker that did not resume the session', function _test(t, done) {
+			reconnectAfterUnackedPublish(
+				done,
+				{ clean: false, sessionPresent: false },
+				({ received, sent }) => {
+					assert.deepStrictEqual(
+						received,
+						[],
+						'a message of the lost session must not be sent again',
+					)
+					assert.instanceOf(sent?.err, Error)
+					assert.match(sent.err.message, /session not resumed/i)
+				},
+			)
+		})
+
+		it('should not send a message again when the store deletes it asynchronously', function _test(t, done) {
+			// the resend reads the store before the delete has taken effect
+			class SlowDelStore extends Store {
+				del(packet, cb) {
+					setImmediate(() => super.del(packet, cb))
+					return this
+				}
+			}
+			reconnectAfterUnackedPublish(
+				done,
+				{
+					clean: false,
+					sessionPresent: false,
+					outgoingStore: new SlowDelStore(),
+				},
+				({ received, sent }) => {
+					assert.deepStrictEqual(received, [])
+					assert.instanceOf(sent?.err, Error)
+				},
+			)
+		})
+
+		it('should still send a message queued while offline to a broker that did not resume the session', function _test(t, done) {
+			reconnectAfterUnackedPublish(
+				done,
+				{
+					clean: false,
+					sessionPresent: false,
+					queueWhileOffline: true,
+				},
+				({ received, sent, queued }) => {
+					assert.deepStrictEqual(received, ['queued'])
+					assert.instanceOf(sent?.err, Error)
+					assert.isDefined(
+						queued,
+						'the queued publish never finished',
+					)
+					assert.notExists(queued.err)
+				},
+			)
+		})
+
+		it('should send the stored messages again after a clean start', function _test(t, done) {
+			reconnectAfterUnackedPublish(
+				done,
+				{ clean: true, sessionPresent: false, queueWhileOffline: true },
+				({ received, sent, queued }) => {
+					assert.deepStrictEqual(received, ['sent', 'queued'])
+					assert.isDefined(sent, 'the sent publish never finished')
+					assert.notExists(sent.err)
+					assert.isDefined(
+						queued,
+						'the queued publish never finished',
+					)
+					assert.notExists(queued.err)
+				},
+			)
+		})
+
+		it('should send the stored messages again to a broker that resumed the session', function _test(t, done) {
+			reconnectAfterUnackedPublish(
+				done,
+				{ clean: false, sessionPresent: true, queueWhileOffline: true },
+				({ received, sent, queued }) => {
+					assert.deepStrictEqual(received, ['sent', 'queued'])
+					assert.isDefined(sent, 'the sent publish never finished')
+					assert.notExists(sent.err)
+					assert.isDefined(
+						queued,
+						'the queued publish never finished',
+					)
+					assert.notExists(queued.err)
+				},
+			)
+		})
 	})
 
 	describe('auto reconnect', () => {

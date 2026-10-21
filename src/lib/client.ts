@@ -559,6 +559,16 @@ export default class MqttClient extends TypedEventEmitter<MqttClientEventCallbac
 	 */
 	private _incomingQoS2Ids: Set<number>
 
+	/**
+	 * Message ids of the QoS 1 and 2 PUBLISH and PUBREL packets written to the
+	 * broker and not acknowledged yet. When the connection ends they are what
+	 * the session had in flight, so if the broker does not resume it they are
+	 * dropped instead of sent again (see `_discardSentOutgoing`). A packet
+	 * queued while offline was never written and is not in it. Like
+	 * `_incomingQoS2Ids`, it follows the lifetime of the store it describes.
+	 */
+	private _sentOutgoingIds: Set<number>
+
 	/** `properties.receiveMaximum`, validated and latched at construction */
 	private _receiveMaximum: number
 
@@ -686,6 +696,9 @@ export default class MqttClient extends TypedEventEmitter<MqttClientEventCallbac
 		// Inbound QoS 2 message ids held in `incomingStore`, for MQTT 5 Receive
 		// Maximum accounting
 		this._incomingQoS2Ids = new Set()
+
+		// Outbound QoS 1 and 2 message ids written to the broker, not acked yet
+		this._sentOutgoingIds = new Set()
 
 		// Latch the quota now: reading it per packet would let a caller mutating
 		// `options` disable the check, and `receiveMaximum: 0` (rejects every
@@ -984,6 +997,45 @@ export default class MqttClient extends TypedEventEmitter<MqttClientEventCallbac
 	}
 
 	/**
+	 * Drops the outgoing QoS 1 and 2 packets already written to the broker in a
+	 * session it did not resume, and fails the publishes waiting on them. Their
+	 * acks are never coming, and sending them again would replay old messages
+	 * into the new session (MQTT 5, 3.2.2.1.1: the client MUST discard its
+	 * session state). A packet queued while offline never reached the broker,
+	 * so it stays in `outgoingStore` and is sent as usual. Only `del` is needed
+	 * from the store.
+	 */
+	private _discardSentOutgoing(): void {
+		if (this._sentOutgoingIds.size === 0) {
+			return
+		}
+
+		this.log(
+			'_discardSentOutgoing :: session not resumed, dropping %d outgoing message(s)',
+			this._sentOutgoingIds.size,
+		)
+
+		const callbacks: PacketCallback[] = []
+		for (const messageId of this._sentOutgoingIds) {
+			this.outgoingStore.del({ messageId }, this.noop)
+			// The resend that follows reads the store, which an asynchronous
+			// implementation may not have updated yet: skip the entry there.
+			this._packetIdsDuringStoreProcessing[messageId] = true
+			if (this.outgoing[messageId]) {
+				callbacks.push(this.outgoing[messageId].cb)
+				delete this.outgoing[messageId]
+			}
+		}
+		this._sentOutgoingIds.clear()
+
+		// after the bookkeeping: a callback may publish again
+		const err = new Error(
+			'Session not resumed by the broker, message delivery not confirmed',
+		)
+		callbacks.forEach((cb) => cb(err))
+	}
+
+	/**
 	 * Setup the event handlers in the inner stream, sends `connect` and `auth` packets
 	 */
 	public connect() {
@@ -1028,6 +1080,7 @@ export default class MqttClient extends TypedEventEmitter<MqttClientEventCallbac
 			this.incomingStore = this.options.incomingStore || new Store()
 			this.outgoingStore = this.options.outgoingStore || new Store()
 			this._incomingQoS2Ids.clear()
+			this._sentOutgoingIds.clear()
 			this.disconnecting = false
 			this.disconnected = false
 		}
@@ -1881,6 +1934,7 @@ export default class MqttClient extends TypedEventEmitter<MqttClientEventCallbac
 			this.log('end :: closeStores: closing incoming and outgoing stores')
 			this.disconnected = true
 			this._incomingQoS2Ids.clear()
+			this._sentOutgoingIds.clear()
 			this.incomingStore.close((e1) => {
 				this.outgoingStore.close((e2) => {
 					this.log('end :: closeStores: emitting end')
@@ -2021,6 +2075,7 @@ export default class MqttClient extends TypedEventEmitter<MqttClientEventCallbac
 			this.incomingStore = this.options.incomingStore || new Store()
 			this.outgoingStore = this.options.outgoingStore || new Store()
 			this._incomingQoS2Ids.clear()
+			this._sentOutgoingIds.clear()
 			this.disconnecting = false
 			this.disconnected = false
 			this._deferredReconnect = null
@@ -2376,6 +2431,12 @@ export default class MqttClient extends TypedEventEmitter<MqttClientEventCallbac
 			this.options,
 		)
 		this.log('_writePacket :: writeToStream result %s', result)
+		if (
+			(packet.cmd === 'publish' && packet.qos > 0) ||
+			packet.cmd === 'pubrel'
+		) {
+			this._sentOutgoingIds.add(packet.messageId)
+		}
 		if (!result && cb && cb !== this.noop) {
 			this.log(
 				'_writePacket :: handle events on `drain` once through callback.',
@@ -2691,6 +2752,11 @@ export default class MqttClient extends TypedEventEmitter<MqttClientEventCallbac
 			(this.options.protocolVersion < 4 || packet.sessionPresent === true)
 		if (!sessionResumed) {
 			this._discardIncomingQoS2State()
+			// `clean: true` keeps sending what it has in the store after a
+			// reconnect, as it always did
+			if (!this.options.clean) {
+				this._discardSentOutgoing()
+			}
 		}
 
 		this.messageIdProvider.clear()
@@ -2847,6 +2913,7 @@ export default class MqttClient extends TypedEventEmitter<MqttClientEventCallbac
 		cb: PacketCallback,
 	) {
 		delete this.outgoing[messageId]
+		this._sentOutgoingIds.delete(messageId)
 		this.outgoingStore.del({ messageId }, (err, packet) => {
 			cb(err, packet)
 			this.messageIdProvider.deallocate(messageId)
